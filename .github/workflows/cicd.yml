@@ -174,13 +174,19 @@ jobs:
 
       - name: "1. Triggerează pipeline-ul Jenkins"
         run: |
+          # Citește numărul build-ului curent înainte de trigger
+          BEFORE_NUM=$(curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
+            "$JENKINS_URL/job/$JENKINS_JOB/api/json" | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('lastBuild',{}).get('number',0) or 0)" 2>/dev/null || echo "0")
+          echo "Build curent înainte de trigger: #$BEFORE_NUM"
+          echo "BEFORE_NUM=$BEFORE_NUM" >> "$GITHUB_ENV"
+
           # Fetch crumb + session cookie together (crumb is session-bound)
           CRUMB_JSON=$(curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
             --cookie-jar /tmp/jenkins-cookies.txt \
             "$JENKINS_URL/crumbIssuer/api/json")
           CRUMB_FIELD=$(echo "$CRUMB_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['crumbRequestField'])" 2>/dev/null || echo "Jenkins-Crumb")
           CRUMB_VALUE=$(echo "$CRUMB_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['crumb'])" 2>/dev/null || echo "")
-          echo "Crumb field: $CRUMB_FIELD"
 
           curl -s -X POST \
             "$JENKINS_URL/job/$JENKINS_JOB/build" \
@@ -198,22 +204,24 @@ jobs:
             exit 1
           }
 
-          QUEUE_URL=$(grep -i "^Location:" /tmp/trigger_headers.txt | tr -d '\r' | awk '{print $2}')
-          echo "QUEUE_URL=$QUEUE_URL" >> "$GITHUB_ENV"
-
-      - name: "3. Așteaptă pornirea build-ului"
+      - name: "2. Așteaptă pornirea build-ului"
         run: |
-          BUILD_URL=""
-          for i in $(seq 1 24); do
+          NEXT_NUM=$((BEFORE_NUM + 1))
+          BUILD_URL="$JENKINS_URL/job/$JENKINS_JOB/$NEXT_NUM/"
+          echo "Aștept build #$NEXT_NUM la $BUILD_URL"
+
+          for i in $(seq 1 60); do
             sleep 5
-            BUILD_URL=$(curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
-              "${QUEUE_URL}api/json" | \
-              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('executable',{}).get('url',''))" 2>/dev/null || echo "")
-            [ -n "$BUILD_URL" ] && break
-            echo "  aștept... ($i/24)"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
+              "${BUILD_URL}api/json" 2>/dev/null || echo "000")
+            [ "$STATUS" = "200" ] && break
+            echo "  aștept pornirea... ($i/60) HTTP=$STATUS"
           done
-          [ -n "$BUILD_URL" ] || { echo "ERROR: build-ul nu a pornit"; exit 1; }
+
+          [ "$STATUS" = "200" ] || { echo "ERROR: build #$NEXT_NUM nu a pornit"; exit 1; }
           echo "BUILD_URL=$BUILD_URL" >> "$GITHUB_ENV"
+          echo "Build pornit: $BUILD_URL"
 
       - name: "4. Monitorizează Jenkins până la finalizare"
         run: |
