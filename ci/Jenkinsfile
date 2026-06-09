@@ -211,6 +211,8 @@ pipeline {
                                 tasks['Frontend — npm ci + build'] = {
                                     dir(cfg.frontend_dir ?: 'frontend') {
                                         sh 'npm ci'
+                                        // Remove nested postcss that breaks Node 20 exports resolution
+                                        sh 'rm -rf node_modules/postcss-safe-parser/node_modules/postcss 2>/dev/null || true'
                                         sh cfg.build_command ?: 'npm run build'
                                     }
                                 }
