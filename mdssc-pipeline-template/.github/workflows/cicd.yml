@@ -187,6 +187,7 @@ jobs:
             -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
             --cookie /tmp/jenkins-cookies.txt \
             -H "$CRUMB_FIELD: $CRUMB_VALUE" \
+            --data-urlencode "json={}" \
             -D /tmp/trigger_headers.txt -o /tmp/trigger_body.txt
 
           HTTP_CODE=$(grep "HTTP/" /tmp/trigger_headers.txt | tail -1 | awk '{print $2}')
