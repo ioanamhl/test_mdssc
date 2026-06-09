@@ -124,6 +124,7 @@ jobs:
             --exclude='*.pyc' \
             ./ /tmp/mdssc-src/
 
+          set +e
           docker run --rm \
             -e MDSSC_SERVER="$MDSSC_SERVER" \
             -e MDSSC_API_KEY="$MDSSC_API_KEY" \
@@ -131,7 +132,18 @@ jobs:
             -e VULNERABILITY_THRESHOLD="$THRESHOLD" \
             -e SCAN_TIMEOUT="900" \
             -v /tmp/mdssc-src:/scan \
-            opswat/mdssc-scanner:latest
+            opswat/mdssc-scanner:latest > /tmp/mdssc-output.txt 2>&1
+          SCAN_EXIT=$?
+          set -e
+
+          echo "=== MDSSC Scan Summary ==="
+          # Extrage ultimul bloc SCAN RESULTS SUMMARY (raportul agregat final)
+          awk '/SCAN RESULTS SUMMARY/{found=1; buf=""} found{buf=buf $0 "\n"} /^={10,}/{if(found) last=buf} END{printf "%s", last}' \
+            /tmp/mdssc-output.txt
+          # Afișează linii de eroare/warning de după ultimul summary
+          grep -E "\[ERROR\]|\[WARN\]" /tmp/mdssc-output.txt | tail -3 || true
+
+          exit $SCAN_EXIT
 
   # ── Jenkins trigger — DOAR pe main ───────────────────────────────────────
   deploy:
