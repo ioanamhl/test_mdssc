@@ -174,10 +174,19 @@ jobs:
 
       - name: "1. Triggerează pipeline-ul Jenkins"
         run: |
-          # API token authentication bypasses CSRF — no crumb needed
+          # Fetch crumb + session cookie together (crumb is session-bound)
+          CRUMB_JSON=$(curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
+            --cookie-jar /tmp/jenkins-cookies.txt \
+            "$JENKINS_URL/crumbIssuer/api/json")
+          CRUMB_FIELD=$(echo "$CRUMB_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['crumbRequestField'])" 2>/dev/null || echo "Jenkins-Crumb")
+          CRUMB_VALUE=$(echo "$CRUMB_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['crumb'])" 2>/dev/null || echo "")
+          echo "Crumb field: $CRUMB_FIELD"
+
           curl -s -X POST \
             "$JENKINS_URL/job/$JENKINS_JOB/build" \
             -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
+            --cookie /tmp/jenkins-cookies.txt \
+            -H "$CRUMB_FIELD: $CRUMB_VALUE" \
             -D /tmp/trigger_headers.txt -o /tmp/trigger_body.txt
 
           HTTP_CODE=$(grep "HTTP/" /tmp/trigger_headers.txt | tail -1 | awk '{print $2}')
