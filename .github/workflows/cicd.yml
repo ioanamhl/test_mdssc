@@ -1,0 +1,279 @@
+name: CI/CD + MDSSC
+
+# Un singur workflow:
+#   - CI  (mdssc-scan) rulează la ORICE push/PR/cron/dispatch
+#   - CD  (deploy -> e2e -> release) rulează DOAR pe push pe `main` (sau manual)
+# Release-ul e complet automat (semver auto), fără tag-uri `v*` introduse manual.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  schedule:
+    - cron: "27 3 * * *"
+  workflow_dispatch:
+    inputs:
+      jenkins_timeout_minutes:
+        description: 'Jenkins build timeout (minutes)'
+        default: '30'
+        required: false
+        type: number
+
+permissions: {}
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+
+  # ── Citire pipeline.config.yml ─────────────────────────────────────────────
+  read-config:
+    name: Read pipeline.config.yml
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      jenkins_mode: ${{ steps.cfg.outputs.jenkins_mode }}
+      jenkins_url:  ${{ steps.cfg.outputs.jenkins_url }}
+      jenkins_job:  ${{ steps.cfg.outputs.jenkins_job }}
+      project_name: ${{ steps.cfg.outputs.project_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install yq
+        run: |
+          wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      - name: Parse pipeline.config.yml
+        id: cfg
+        run: |
+          echo "jenkins_mode=$(yq '.jenkins_mode // "none"'    pipeline.config.yml)" >> $GITHUB_OUTPUT
+          echo "jenkins_url=$(yq  '.jenkins_url  // ""'        pipeline.config.yml)" >> $GITHUB_OUTPUT
+          echo "jenkins_job=$(yq  '.jenkins_job  // "pipeline"' pipeline.config.yml)" >> $GITHUB_OUTPUT
+          echo "project_name=$(yq '.project_name // "app"'     pipeline.config.yml)" >> $GITHUB_OUTPUT
+
+      - name: Validare Jenkins obligatoriu
+        run: |
+          mode=$(yq '.jenkins_mode // "none"' pipeline.config.yml)
+          if [ "$mode" = "none" ]; then
+            echo "ERROR: jenkins_mode este 'none'. Jenkins este obligatoriu."
+            echo "Setează jenkins_mode la 'docker' sau 'external' în pipeline.config.yml."
+            exit 1
+          fi
+          url=$(yq '.jenkins_url // ""' pipeline.config.yml)
+          if [ -z "$url" ] || [ "$url" = "null" ]; then
+            echo "ERROR: jenkins_url nu este setat în pipeline.config.yml."
+            echo "Exemplu: jenkins_url: \"http://123.456.78.90:8080\""
+            exit 1
+          fi
+
+  # ── MDSSC Scan — rulează MEREU ────────────────────────────────────────────
+  mdssc-scan:
+    name: MDSSC Scan (OPSWAT)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Login Docker Hub (optional — evită rate-limit anonim)
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Install yq
+        run: |
+          wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
+
+      - name: MDSSC Scan (secrete + vulnerabilități + malware + SBOM)
+        env:
+          MDSSC_SERVER:  ${{ secrets.MDSSC_SERVER }}
+          MDSSC_API_KEY: ${{ secrets.MDSSC_API_KEY }}
+        run: |
+          set -e
+          THRESHOLD=$(yq '.mdssc_threshold // "critical"' pipeline.config.yml)
+
+          mkdir -p /tmp/mdssc-src
+          rsync -a \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='dist' \
+            --exclude='build' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            ./ /tmp/mdssc-src/
+
+          docker run --rm \
+            -e MDSSC_SERVER="$MDSSC_SERVER" \
+            -e MDSSC_API_KEY="$MDSSC_API_KEY" \
+            -e FAIL_ON_VULNERABILITIES="true" \
+            -e VULNERABILITY_THRESHOLD="$THRESHOLD" \
+            -e SCAN_TIMEOUT="900" \
+            -v /tmp/mdssc-src:/scan \
+            opswat/mdssc-scanner:latest
+
+  # ── Jenkins trigger — DOAR pe main ───────────────────────────────────────
+  deploy:
+    name: Jenkins (MDSSC + Build + Deploy)
+    needs: [mdssc-scan, read-config]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    env:
+      JENKINS_URL:       ${{ needs.read-config.outputs.jenkins_url || secrets.JENKINS_VPS_URL }}
+      JENKINS_USER:      ${{ secrets.JENKINS_USER }}
+      JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
+      JENKINS_JOB:       ${{ needs.read-config.outputs.jenkins_job }}
+      JENKINS_TIMEOUT_MIN: ${{ inputs.jenkins_timeout_minutes || '30' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: "1. Obține CSRF crumb de la Jenkins"
+        run: |
+          CRUMB=$(curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
+            "$JENKINS_URL/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb)")
+          echo "CRUMB=$CRUMB" >> "$GITHUB_ENV"
+
+      - name: "2. Triggerează pipeline-ul Jenkins"
+        run: |
+          curl -s -X POST \
+            "$JENKINS_URL/job/$JENKINS_JOB/buildWithParameters" \
+            -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
+            -H "$CRUMB" \
+            -D /tmp/trigger_headers.txt -o /dev/null
+
+          HTTP_CODE=$(grep "HTTP/" /tmp/trigger_headers.txt | tail -1 | awk '{print $2}')
+          echo "Trigger HTTP: $HTTP_CODE"
+          [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ] || { echo "ERROR: trigger failed"; exit 1; }
+
+          QUEUE_URL=$(grep -i "^Location:" /tmp/trigger_headers.txt | tr -d '\r' | awk '{print $2}')
+          echo "QUEUE_URL=$QUEUE_URL" >> "$GITHUB_ENV"
+
+      - name: "3. Așteaptă pornirea build-ului"
+        run: |
+          BUILD_URL=""
+          for i in $(seq 1 24); do
+            sleep 5
+            BUILD_URL=$(curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
+              "${QUEUE_URL}api/json" | \
+              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('executable',{}).get('url',''))" 2>/dev/null || echo "")
+            [ -n "$BUILD_URL" ] && break
+            echo "  aștept... ($i/24)"
+          done
+          [ -n "$BUILD_URL" ] || { echo "ERROR: build-ul nu a pornit"; exit 1; }
+          echo "BUILD_URL=$BUILD_URL" >> "$GITHUB_ENV"
+
+      - name: "4. Monitorizează Jenkins până la finalizare"
+        run: |
+          ITERATIONS=$(( JENKINS_TIMEOUT_MIN * 60 / 15 ))
+          for i in $(seq 1 $ITERATIONS); do
+            sleep 15
+            RESULT=$(curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
+              "${BUILD_URL}api/json" | \
+              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result') or '')" 2>/dev/null || echo "")
+            echo "  [$i/$ITERATIONS] status: ${RESULT:-IN_PROGRESS}"
+            [ "$RESULT" = "SUCCESS" ] && { echo "=== Jenkins: SUCCES ==="; exit 0; }
+            [ -n "$RESULT" ] && { echo "=== Jenkins: EȘUAT ($RESULT) ==="; exit 1; }
+          done
+          echo "ERROR: Timeout după ${JENKINS_TIMEOUT_MIN} minute"; exit 1
+
+  # ── E2E Tests ─────────────────────────────────────────────────────────────
+  e2e:
+    name: E2E Tests (Playwright)
+    needs: [deploy]
+    if: always() && needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalează dependințe E2E
+        run: npm ci
+        working-directory: e2e
+
+      - name: Instalează Playwright browsers
+        run: npx playwright install --with-deps chromium
+        working-directory: e2e
+
+      - name: Rulează teste E2E
+        run: npx playwright test
+        working-directory: e2e
+        env:
+          BASE_URL: ${{ secrets.VPS_BASE_URL }}
+
+      - name: Upload raport Playwright
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/
+
+  # ── Auto Release (semver) ─────────────────────────────────────────────────
+  release:
+    name: Auto Release (semver)
+    needs: e2e
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Calculează versiunea (semver auto)
+        id: ver
+        run: |
+          git fetch --tags --force --quiet || true
+          latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          latest=${latest:-v0.0.0}
+          base=${latest#v}; major=${base%%.*}; rest=${base#*.}; minor=${rest%%.*}; patch=${rest#*.}
+          msg=$(git log -1 --pretty=%B)
+          if echo "$msg" | grep -qiE 'BREAKING CHANGE|!:'; then
+            major=$((major+1)); minor=0; patch=0
+          elif echo "$msg" | grep -qiE '^feat'; then
+            minor=$((minor+1)); patch=0
+          else
+            patch=$((patch+1))
+          fi
+          next="v${major}.${minor}.${patch}"
+          echo "Versiune nouă: $next"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Creează GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.next }}
+          generate_release_notes: true

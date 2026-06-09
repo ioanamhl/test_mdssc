@@ -1,0 +1,42 @@
+# =============================================================================
+#  MDSSC Pipeline Template — pipeline.config.yml
+#  Singurul fișier pe care trebuie să îl completezi.
+#  Toate celelalte fișiere citesc valorile de aici automat.
+# =============================================================================
+
+# ── Identificare proiect ──────────────────────────────────────────────────────
+project_name: "demo-app"
+github_repo: "https://github.com/ioanamhl/test_mdssc"
+
+# ── Stack aplicație ───────────────────────────────────────────────────────────
+stack: "node"             # node | python | java | go
+build_command: "npm run build"
+build_output: "build/"
+app_port: 3001
+
+# ── Jenkins ───────────────────────────────────────────────────────────────────
+# Jenkins este obligatoriu. Alege modul în funcție de infrastructura ta:
+#   "docker"   → Jenkins local via Docker (bun pentru demo/dev)
+#   "external" → Jenkins pe VPS propriu (recomandat pentru producție)
+jenkins_mode: "docker"
+
+# Adresa unde va fi accesibil Jenkins
+# Completează cu URL-ul ngrok după ce rulezi: ngrok http 8080
+# Exemplu: "https://abc123.ngrok-free.app"
+jenkins_url: "https://college-lot-ballet-extension.trycloudflare.com"
+jenkins_port: 8080
+jenkins_job: "demo-app-pipeline"
+
+# ── Deploy ────────────────────────────────────────────────────────────────────
+# Cum se face deploy-ul după build:
+#   "pm2"      → PM2 process manager (Node.js)
+#   "docker"   → docker-compose up
+#   "systemd"  → systemctl restart
+#   "none"     → fără deploy automat
+deploy_method: "pm2"
+
+# ── MDSSC ─────────────────────────────────────────────────────────────────────
+# Pragul de severitate sub care build-ul e blocat:
+#   "critical" | "high" | "medium" | "low"
+mdssc_threshold: "critical"
+

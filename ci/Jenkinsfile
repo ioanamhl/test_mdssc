@@ -1,0 +1,334 @@
+// ============================================================
+// MDSSC Pipeline Template — Jenkinsfile
+//
+// Citește configurația din pipeline.config.yml aflat în rădăcina repo-ului.
+// Nu modifica acest fișier — modifică pipeline.config.yml.
+//
+// Stages:
+//   1. Checkout          — clone, tool checks
+//   2. Check Health      — MDSSC server health check
+//   3. Fetch Workflow    — workflow metadata (StorageId + RepositoryId)
+//   4. Security Scan     — npm audit + ESLint (doar pentru stack: node)
+//   5. Source Code Scan  — indirect branch scan (MDSSC pulls from GitHub)
+//   6. Build             — build adaptat la stack din config
+//   7. Artifact Scan     — scan toate build output-urile
+//   8. Deploy            — deploy adaptat la deploy_method din config
+// ============================================================
+
+def mdssc
+def cfg
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        skipDefaultCheckout(false)
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    parameters {
+        booleanParam(name: 'RUN_REPO_SCAN',     defaultValue: true,  description: 'Indirect repo scan via MDSSC.')
+        booleanParam(name: 'RUN_ARTIFACT_SCAN', defaultValue: true,  description: 'Scan build artifacts with MDSSC.')
+        booleanParam(name: 'RUN_DEPLOY',        defaultValue: true,  description: 'Deploy after all scans pass.')
+
+        // MDSSC connection — citite din pipeline.config.yml, pot fi suprascrise aici
+        string(name: 'MDSSC_SERVER',         defaultValue: '', description: 'MDSSC server URL. Lasă gol pentru a citi din pipeline.config.yml.')
+        string(name: 'MDSSC_CREDENTIALS_ID', defaultValue: 'mdssc-api-key', description: 'Jenkins credential ID pentru MDSSC API key.')
+        string(name: 'MDSSC_API_KEY_HEADER', defaultValue: 'apikey', description: 'HTTP header pentru MDSSC API key.')
+
+        string(name: 'MDSSC_WORKFLOW_ID',             defaultValue: '', description: 'MDSSC workflow ID. Gol = auto-detect.')
+        string(name: 'MDSSC_SCAN_TIMEOUT',            defaultValue: '900', description: 'Secunde maxim pentru un scan.')
+        string(name: 'MDSSC_POLL_INTERVAL',           defaultValue: '10',  description: 'Secunde între poll-uri /overview.')
+        choice(name: 'MDSSC_VULNERABILITY_THRESHOLD', choices: ['none', 'critical', 'high', 'medium', 'low'], description: 'Severitate minimă care oprește build-ul.')
+        booleanParam(name: 'MDSSC_FAIL_ON_VULNERABILITIES', defaultValue: true,  description: 'Oprește build-ul la vulnerabilități.')
+        booleanParam(name: 'MDSSC_SKIP_LARGE_ARTIFACTS',    defaultValue: true,  description: 'Skip artefacte > MDSSC_MAX_UPLOAD_MB.')
+        string(name: 'MDSSC_MAX_UPLOAD_MB', defaultValue: '100', description: 'Dimensiune maximă artefact (MB).')
+    }
+
+    environment {
+        ARTIFACT_DIR         = 'artifacts'
+        COMPOSE_PROJECT_NAME = 'mdssc-template'
+    }
+
+    stages {
+
+        // ----------------------------------------------------------
+        // 1. CHECKOUT
+        // ----------------------------------------------------------
+        stage('Checkout') {
+            steps {
+                checkout scm
+
+                script {
+                    // Încarcă librăria MDSSC
+                    mdssc = load 'ci/mdsscAdvanced.groovy'
+
+                    // Citește pipeline.config.yml
+                    cfg = readYaml file: 'pipeline.config.yml'
+
+                    echo "=== Pipeline Config ==="
+                    echo "Project     : ${cfg.project_name}"
+                    echo "Stack       : ${cfg.stack}"
+                    echo "Deploy      : ${cfg.deploy_method}"
+                    echo "Jenkins Mode: ${cfg.jenkins_mode}"
+                    echo "MDSSC Thresh: ${cfg.mdssc_threshold}"
+
+                    // Suprascrie threshold din config dacă nu e setat în parametri
+                    if (!params.MDSSC_VULNERABILITY_THRESHOLD || params.MDSSC_VULNERABILITY_THRESHOLD == 'none') {
+                        env.MDSSC_VULNERABILITY_THRESHOLD = cfg.mdssc_threshold ?: 'critical'
+                    }
+                }
+
+                sh '''
+                    echo "=== Build Info ==="
+                    echo "Branch : $(git rev-parse --abbrev-ref HEAD)"
+                    echo "Commit : $(git rev-parse --short HEAD)"
+                    echo "=== Tool Versions ==="
+                    node --version  2>/dev/null || echo "node: not found"
+                    npm  --version  2>/dev/null || echo "npm: not found"
+                    docker --version 2>/dev/null || echo "docker: not found"
+                '''
+
+                sh 'rm -rf "$ARTIFACT_DIR" && mkdir -p "$ARTIFACT_DIR"'
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 2. CHECK HEALTH
+        // ----------------------------------------------------------
+        stage('Check Health') {
+            steps {
+                script {
+                    def mdsscServer = params.MDSSC_SERVER?.trim() ?: cfg.mdssc_server ?: ''
+                    mdssc.checkHealth(mdsscServer ? [server: mdsscServer] : [:])
+                }
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 3. FETCH WORKFLOW
+        // ----------------------------------------------------------
+        stage('Fetch Workflow') {
+            steps {
+                script {
+                    env.MDSSC_WF_ID            = ''
+                    env.MDSSC_WF_STORAGE_ID    = ''
+                    env.MDSSC_WF_REPOSITORY_ID = ''
+
+                    def wf = mdssc.fetchWorkflow([:])
+                    env.MDSSC_WF_ID            = wf.workflowId    ?: ''
+                    env.MDSSC_WF_STORAGE_ID    = wf.storageId     ?: ''
+                    env.MDSSC_WF_REPOSITORY_ID = wf.repositoryId  ?: ''
+                    echo "Workflow — ID: ${env.MDSSC_WF_ID} | StorageId: ${env.MDSSC_WF_STORAGE_ID} | RepositoryId: ${env.MDSSC_WF_REPOSITORY_ID}"
+                }
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 4. SECURITY SCAN (npm audit + ESLint — doar pentru Node.js)
+        // ----------------------------------------------------------
+        stage('Security Scan') {
+            when {
+                expression { return cfg.stack == 'node' }
+            }
+            steps {
+                script {
+                    echo "=== Security Scan (npm audit + ESLint) ==="
+
+                    // Backend
+                    if (fileExists("${cfg.backend_dir ?: 'backend'}/package.json")) {
+                        dir(cfg.backend_dir ?: 'backend') {
+                            sh 'npm ci --prefer-offline 2>/dev/null || npm ci'
+                            sh 'npm audit --json > ../artifacts/backend-audit.json 2>/dev/null || true'
+                        }
+                    }
+
+                    // Frontend
+                    if (fileExists("${cfg.frontend_dir ?: 'frontend'}/package.json")) {
+                        dir(cfg.frontend_dir ?: 'frontend') {
+                            sh 'npm ci --prefer-offline 2>/dev/null || npm ci'
+                            sh 'npm audit --json > ../artifacts/frontend-audit.json 2>/dev/null || true'
+                            sh 'npx eslint . --format json --output-file ../artifacts/eslint-report.json 2>/dev/null || true'
+                        }
+                    }
+
+                    // Single package.json în rădăcină
+                    if (!fileExists("${cfg.backend_dir ?: 'backend'}/package.json") && fileExists('package.json')) {
+                        sh 'npm ci --prefer-offline 2>/dev/null || npm ci'
+                        sh 'npm audit --json > artifacts/audit.json 2>/dev/null || true'
+                        sh 'npx eslint . --format json --output-file artifacts/eslint-report.json 2>/dev/null || true'
+                    }
+
+                    archiveArtifacts artifacts: 'artifacts/*.json', allowEmptyArchive: true, fingerprint: true
+                }
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 5. SOURCE CODE SCAN
+        // ----------------------------------------------------------
+        stage('MDSSC Source Code Scan') {
+            when {
+                expression { return params.RUN_REPO_SCAN }
+            }
+            steps {
+                script {
+                    env.MDSSC_REPO_SCAN_ID = ''
+
+                    def branchName = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+                    if (branchName == 'HEAD') branchName = 'main'
+
+                    env.MDSSC_REPO_SCAN_ID = mdssc.scanRepositoryIndirect(
+                        [workflowId: env.MDSSC_WF_ID, branch: branchName, label: "${cfg.project_name}-repo-${branchName}"],
+                        [storageId: env.MDSSC_WF_STORAGE_ID ?: '', repositoryId: env.MDSSC_WF_REPOSITORY_ID ?: '']
+                    ) ?: ''
+                }
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 6. BUILD — adaptat la stack din config
+        // ----------------------------------------------------------
+        stage('Build') {
+            steps {
+                script {
+                    echo "=== Build (stack: ${cfg.stack}) ==="
+
+                    if (cfg.stack == 'node') {
+                        // Node.js: structură cu backend/frontend SAU singur package.json
+                        def hasBackend  = fileExists("${cfg.backend_dir ?: 'backend'}/package.json")
+                        def hasFrontend = fileExists("${cfg.frontend_dir ?: 'frontend'}/package.json")
+
+                        if (hasBackend || hasFrontend) {
+                            def tasks = [:]
+                            if (hasBackend) {
+                                tasks['Backend — npm ci'] = {
+                                    dir(cfg.backend_dir ?: 'backend') { sh 'npm ci' }
+                                }
+                            }
+                            if (hasFrontend) {
+                                tasks['Frontend — npm ci + build'] = {
+                                    dir(cfg.frontend_dir ?: 'frontend') {
+                                        sh 'npm ci'
+                                        sh cfg.build_command ?: 'npm run build'
+                                    }
+                                }
+                            }
+                            parallel tasks
+                        } else {
+                            sh 'npm ci'
+                            sh cfg.build_command ?: 'npm run build'
+                        }
+
+                    } else if (cfg.stack == 'python') {
+                        sh 'pip install -r requirements.txt'
+                        if (cfg.build_command) sh cfg.build_command
+
+                    } else if (cfg.stack == 'java') {
+                        sh cfg.build_command ?: 'mvn package -DskipTests'
+
+                    } else if (cfg.stack == 'go') {
+                        sh cfg.build_command ?: 'go build ./...'
+
+                    } else {
+                        // Custom — rulează exact ce e în config
+                        if (cfg.build_command) sh cfg.build_command
+                        else echo "WARNING: build_command nespecificat în pipeline.config.yml"
+                    }
+
+                    // Packaging artefacte
+                    sh """
+                        echo "=== Packaging artifacts ==="
+                        build_out="${cfg.build_output ?: 'dist/'}"
+                        if [ -d "\$build_out" ]; then
+                            tar -czf "\$ARTIFACT_DIR/build-output.tar.gz" -C "\$build_out" .
+                            echo "Build output packaged: \$build_out"
+                        fi
+                        echo "=== Artifact sizes ==="
+                        du -sh "\$ARTIFACT_DIR"/* 2>/dev/null || echo "No artifacts yet"
+                    """
+
+                    archiveArtifacts artifacts: "${ARTIFACT_DIR}/**", fingerprint: true, allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 7. ARTIFACT SCAN
+        // ----------------------------------------------------------
+        stage('Artifact Scan') {
+            when {
+                expression { return params.RUN_ARTIFACT_SCAN }
+            }
+            steps {
+                script {
+                    def ids = mdssc.scanArtifacts(artifactDir: "${ARTIFACT_DIR}")
+                    env.MDSSC_ARTIFACT_SCAN_IDS = ids.join(',')
+
+                    List<String> allIds = []
+                    if (env.MDSSC_REPO_SCAN_ID?.trim()) allIds << env.MDSSC_REPO_SCAN_ID.trim()
+                    (env.MDSSC_ARTIFACT_SCAN_IDS ?: '').split(',').findAll { it.trim() }.each { allIds << it.trim() }
+                    mdssc.printFinalSummary([:], allIds, env.MDSSC_WF_REPOSITORY_ID ?: '')
+                }
+            }
+        }
+
+        // ----------------------------------------------------------
+        // 8. DEPLOY — adaptat la deploy_method din config
+        // ----------------------------------------------------------
+        stage('Deploy') {
+            when {
+                expression { return params.RUN_DEPLOY && cfg.deploy_method != 'none' }
+            }
+            steps {
+                script {
+                    echo "=== Deploy (method: ${cfg.deploy_method}) ==="
+                    def projectName = cfg.project_name ?: 'app'
+                    def appPort     = cfg.app_port ?: 3000
+
+                    if (cfg.deploy_method == 'pm2') {
+                        sh """
+                            pm2 restart ${projectName} 2>/dev/null || \\
+                            pm2 start ${WORKSPACE}/${cfg.backend_dir ?: 'backend'}/server.js \\
+                                --name ${projectName} \\
+                                --cwd  ${WORKSPACE}/${cfg.backend_dir ?: 'backend'}
+                            pm2 save
+                            pm2 list
+                        """
+                        // Frontend static (dacă există)
+                        if (fileExists("${cfg.frontend_dir ?: 'frontend'}/dist")) {
+                            sh """
+                                pm2 restart ${projectName}-frontend 2>/dev/null || \\
+                                pm2 serve ${WORKSPACE}/${cfg.frontend_dir ?: 'frontend'}/dist ${appPort.toInteger() + 1} \\
+                                    --name ${projectName}-frontend --spa
+                                pm2 save
+                            """
+                        }
+
+                    } else if (cfg.deploy_method == 'docker') {
+                        sh 'docker compose up -d --build'
+
+                    } else if (cfg.deploy_method == 'systemd') {
+                        sh "systemctl restart ${projectName}"
+
+                    } else {
+                        echo "deploy_method necunoscut: ${cfg.deploy_method}. Sărit."
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline ${cfg?.project_name ?: 'MDSSC'} completat cu succes — app is live."
+        }
+        failure {
+            echo "Pipeline eșuat — deploy blocat. Verifică MDSSC scan output și console log."
+        }
+        always {
+            sh 'rm -f .mdssc-* 2>/dev/null || true'
+        }
+    }
+}
