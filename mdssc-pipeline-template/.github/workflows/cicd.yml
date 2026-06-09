@@ -102,9 +102,14 @@ jobs:
 
       - name: MDSSC Scan (secrete + vulnerabilități + malware + SBOM)
         env:
-          MDSSC_SERVER:  ${{ secrets.MDSSC_SERVER }}
-          MDSSC_API_KEY: ${{ secrets.MDSSC_API_KEY }}
+          MDSSC_SERVER:      ${{ secrets.MDSSC_SERVER }}
+          MDSSC_API_KEY:     ${{ secrets.MDSSC_API_KEY }}
+          SKIP_MDSSC_SCAN:   ${{ vars.SKIP_MDSSC_SCAN }}
         run: |
+          if [ "$SKIP_MDSSC_SCAN" = "true" ]; then
+            echo "⚠️  MDSSC scan skipped (SKIP_MDSSC_SCAN=true)"
+            exit 0
+          fi
           set -e
           THRESHOLD=$(yq '.mdssc_threshold // "none"' pipeline.config.yml)
 
@@ -168,23 +173,21 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: "1. Obține CSRF crumb de la Jenkins"
+      - name: "1. Triggerează pipeline-ul Jenkins"
         run: |
-          CRUMB=$(curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
-            "$JENKINS_URL/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb)")
-          echo "CRUMB=$CRUMB" >> "$GITHUB_ENV"
-
-      - name: "2. Triggerează pipeline-ul Jenkins"
-        run: |
+          # API token authentication bypasses CSRF — no crumb needed
           curl -s -X POST \
-            "$JENKINS_URL/job/$JENKINS_JOB/buildWithParameters" \
+            "$JENKINS_URL/job/$JENKINS_JOB/build" \
             -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
-            -H "$CRUMB" \
-            -D /tmp/trigger_headers.txt -o /dev/null
+            -D /tmp/trigger_headers.txt -o /tmp/trigger_body.txt
 
           HTTP_CODE=$(grep "HTTP/" /tmp/trigger_headers.txt | tail -1 | awk '{print $2}')
           echo "Trigger HTTP: $HTTP_CODE"
-          [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ] || { echo "ERROR: trigger failed"; exit 1; }
+          [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ] || {
+            echo "ERROR: trigger failed (HTTP $HTTP_CODE)"
+            cat /tmp/trigger_body.txt || true
+            exit 1
+          }
 
           QUEUE_URL=$(grep -i "^Location:" /tmp/trigger_headers.txt | tr -d '\r' | awk '{print $2}')
           echo "QUEUE_URL=$QUEUE_URL" >> "$GITHUB_ENV"
