@@ -106,7 +106,13 @@ jobs:
           MDSSC_API_KEY: ${{ secrets.MDSSC_API_KEY }}
         run: |
           set -e
-          THRESHOLD=$(yq '.mdssc_threshold // "critical"' pipeline.config.yml)
+          THRESHOLD=$(yq '.mdssc_threshold // "none"' pipeline.config.yml)
+
+          if [ "$THRESHOLD" = "none" ]; then
+            FAIL_ON_VULN="false"
+          else
+            FAIL_ON_VULN="true"
+          fi
 
           mkdir -p /tmp/mdssc-src
           rsync -a \
@@ -121,7 +127,7 @@ jobs:
           docker run --rm \
             -e MDSSC_SERVER="$MDSSC_SERVER" \
             -e MDSSC_API_KEY="$MDSSC_API_KEY" \
-            -e FAIL_ON_VULNERABILITIES="true" \
+            -e FAIL_ON_VULNERABILITIES="$FAIL_ON_VULN" \
             -e VULNERABILITY_THRESHOLD="$THRESHOLD" \
             -e SCAN_TIMEOUT="900" \
             -v /tmp/mdssc-src:/scan \

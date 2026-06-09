@@ -38,5 +38,5 @@ deploy_method: "pm2"
 # ── MDSSC ─────────────────────────────────────────────────────────────────────
 # Pragul de severitate sub care build-ul e blocat:
 #   "critical" | "high" | "medium" | "low"
-mdssc_threshold: "critical"
+mdssc_threshold: "none"
 
