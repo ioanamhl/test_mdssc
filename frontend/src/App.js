@@ -1,78 +1,70 @@
-import React, { useState, useEffect } from "react";
-import { BrowserRouter } from "react-router-dom";
-import useLocalStorage from "./hooks/useLocalStorage";
-import UserContext from "./auth/UserContext";
-import HomesApi from "./api/api";
-import jwt from "jsonwebtoken";
-import LoadingSpinner from "./common/LoadingSpinner";
-import Routes from "./routes-nav/Routes";
+import React, { useState, useEffect } from 'react';
+import './App.css';
 
-export const TOKEN_STORAGE_ID = "app-token";
+const API = process.env.REACT_APP_API_URL || 'http://localhost:3001';
 
 function App() {
-  const [infoLoaded, setInfoLoaded] = useState(false);
-  const [currentUser, setCurrentUser] = useState(null);
-  const [token, setToken] = useLocalStorage(TOKEN_STORAGE_ID);
+  const [todos, setTodos] = useState([]);
+  const [text, setText] = useState('');
+  const [error, setError] = useState('');
 
-  useEffect(
-    function loadUserInfo() {
-      async function getCurrentUser() {
-        if (token) {
-          try {
-            let { email } = jwt.decode(token);
-            HomesApi.token = token;
-            let currentUser = await HomesApi.getCurrentUser(email);
-            setCurrentUser(currentUser);
-          } catch (err) {
-            console.log("error: ", err);
-            setCurrentUser(null);
-          }
-        }
-        setInfoLoaded(true);
-      }
-      setInfoLoaded(false);
-      getCurrentUser();
-    },
-    [token]
-  );
+  useEffect(() => {
+    fetch(`${API}/api/todos`)
+      .then(r => r.json())
+      .then(setTodos)
+      .catch(() => setError('Could not connect to backend'));
+  }, []);
 
-  function logout() {
-    setCurrentUser(null);
-    setToken(null);
+  async function addTodo(e) {
+    e.preventDefault();
+    if (!text.trim()) return;
+    const res = await fetch(`${API}/api/todos`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    const todo = await res.json();
+    setTodos(prev => [...prev, todo]);
+    setText('');
   }
 
-  async function signup(signupData) {
-    try {
-      let token = await HomesApi.signup(signupData);
-      setToken(token);
-      return { success: true };
-    } catch (errors) {
-      console.log("sign up error: ", errors);
-      return { success: false, errors };
-    }
+  async function toggleTodo(id, done) {
+    const res = await fetch(`${API}/api/todos/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ done: !done }),
+    });
+    const updated = await res.json();
+    setTodos(prev => prev.map(t => (t.id === id ? updated : t)));
   }
 
-  async function login(loginData) {
-    try {
-      let token = await HomesApi.login(loginData);
-      setToken(token);
-      return { success: true };
-    } catch (errors) {
-      console.log("login failed", errors);
-      return { success: false, errors };
-    }
+  async function deleteTodo(id) {
+    await fetch(`${API}/api/todos/${id}`, { method: 'DELETE' });
+    setTodos(prev => prev.filter(t => t.id !== id));
   }
-
-  if (!infoLoaded) return <LoadingSpinner />;
 
   return (
-    <BrowserRouter>
-      <UserContext.Provider value={{ currentUser, setCurrentUser }}>
-        <div className="App">
-          <Routes login={login} signup={signup} logout={logout} />
-        </div>
-      </UserContext.Provider>
-    </BrowserRouter>
+    <div className="app">
+      <h1>Todo App</h1>
+      {error && <p className="error">{error}</p>}
+      <form onSubmit={addTodo} className="form">
+        <input
+          value={text}
+          onChange={e => setText(e.target.value)}
+          placeholder="Add a new task..."
+        />
+        <button type="submit">Add</button>
+      </form>
+      <ul className="list">
+        {todos.map(todo => (
+          <li key={todo.id} className={todo.done ? 'done' : ''}>
+            <span onClick={() => toggleTodo(todo.id, todo.done)}>{todo.text}</span>
+            <button onClick={() => deleteTodo(todo.id)}>✕</button>
+          </li>
+        ))}
+      </ul>
+      <p className="count">{todos.filter(t => !t.done).length} task(s) remaining</p>
+    </div>
   );
 }
 

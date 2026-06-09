@@ -11,7 +11,7 @@ github_repo: "https://github.com/ioanamhl/test_mdssc"
 # ── Stack aplicație ───────────────────────────────────────────────────────────
 stack: "node"             # node | python | java | go
 build_command: "npm run build"
-build_output: "build/"
+build_output: "frontend/build/"
 app_port: 3001
 
 # ── Jenkins ───────────────────────────────────────────────────────────────────
