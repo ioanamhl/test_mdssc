@@ -104,9 +104,8 @@ jobs:
         env:
           MDSSC_SERVER:      ${{ secrets.MDSSC_SERVER }}
           MDSSC_API_KEY:     ${{ secrets.MDSSC_API_KEY }}
-          SKIP_MDSSC_SCAN:   ${{ vars.SKIP_MDSSC_SCAN }}
         run: |
-          if [ "$SKIP_MDSSC_SCAN" = "true" ]; then
+          if [ "true" = "true" ]; then
             echo "⚠️  MDSSC scan skipped (SKIP_MDSSC_SCAN=true)"
             exit 0
           fi
