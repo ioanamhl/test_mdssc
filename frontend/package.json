@@ -47,5 +47,10 @@
   },
   "devDependencies": {
     "prettier": "2.4.1"
+  },
+  "overrides": {
+    "postcss-safe-parser": {
+      "postcss": "^8"
+    }
   }
 }
