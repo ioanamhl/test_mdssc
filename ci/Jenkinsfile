@@ -28,7 +28,7 @@ pipeline {
     }
 
     parameters {
-        booleanParam(name: 'RUN_REPO_SCAN',     defaultValue: true,  description: 'Indirect repo scan via MDSSC.')
+        booleanParam(name: 'RUN_REPO_SCAN',     defaultValue: false, description: 'Indirect repo scan via MDSSC.')
         booleanParam(name: 'RUN_ARTIFACT_SCAN', defaultValue: true,  description: 'Scan build artifacts with MDSSC.')
         booleanParam(name: 'RUN_DEPLOY',        defaultValue: true,  description: 'Deploy after all scans pass.')
 
